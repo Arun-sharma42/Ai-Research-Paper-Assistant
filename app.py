@@ -1,6 +1,7 @@
 import os
 import re
 import datetime
+import json
 from flask import Flask, render_template, request, jsonify, session, send_file
 import fitz  # PyMuPDF
 from groq import Groq
@@ -57,6 +58,84 @@ def get_word_count(text):
     Calculates the word count of a given string.
     """
     return len(text.split())
+
+def robust_json_loads(raw_str, is_array=False):
+    """
+    Attempts to load a JSON string using standard json.loads.
+    If that fails, performs robust cleaning and falls back to regular
+    expression-based key-value extraction to handle unescaped quotes.
+    """
+    raw_str = raw_str.strip()
+    if raw_str.startswith("```"):
+        if "json" in raw_str[:15]:
+            raw_str = raw_str.split("json", 1)[1]
+        else:
+            raw_str = raw_str.split("\n", 1)[1]
+        if raw_str.endswith("```"):
+            raw_str = raw_str.rsplit("```", 1)[0]
+    raw_str = raw_str.strip()
+    
+    # Try standard json loads first
+    try:
+        if is_array:
+            match = re.search(r'\[.*\]', raw_str, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+        else:
+            match = re.search(r'\{.*\}', raw_str, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+        return json.loads(raw_str)
+    except Exception as e:
+        print(f"Standard JSON parse failed: {e}. Executing robust fallback parsing.")
+        
+    if is_array:
+        cards = []
+        # Find all objects between { and }
+        objects = re.findall(r'\{([^{}]+)\}', raw_str, re.DOTALL)
+        for obj in objects:
+            try:
+                # Extract term and definition with robust regex
+                term_match = re.search(r'"term"\s*:\s*"(.*?)"\s*,', obj, re.IGNORECASE | re.DOTALL)
+                if not term_match:
+                    term_match = re.search(r'"term"\s*:\s*"(.*?)"', obj, re.IGNORECASE | re.DOTALL)
+                
+                # Using greedy match for definition to capture unescaped double quotes inside values
+                def_match = re.search(r'"definition"\s*:\s*"(.*)"', obj, re.IGNORECASE | re.DOTALL)
+                
+                if term_match and def_match:
+                    cards.append({
+                        "term": term_match.group(1).strip(),
+                        "definition": def_match.group(1).strip()
+                    })
+            except Exception as ex:
+                print(f"Fallback card object parsing failed: {ex}")
+        if len(cards) >= 3:
+            return cards
+    else:
+        metadata = {}
+        keys = ['title', 'journal', 'year', 'volume', 'issue', 'pages', 'publisher']
+        for key in keys:
+            match = re.search(rf'"{key}"\s*:\s*"(.*?)"', raw_str, re.IGNORECASE | re.DOTALL)
+            if match:
+                metadata[key] = match.group(1).strip()
+        
+        # Special matching for authors list
+        authors_match = re.search(r'"authors"\s*:\s*\[(.*?)\]', raw_str, re.IGNORECASE | re.DOTALL)
+        if authors_match:
+            authors_str = authors_match.group(1)
+            authors = re.findall(r'"(.*?)"', authors_str)
+            metadata['authors'] = [a.strip() for a in authors]
+        else:
+            authors_str_match = re.search(r'"authors"\s*:\s*"(.*?)"', raw_str, re.IGNORECASE | re.DOTALL)
+            if authors_str_match:
+                metadata['authors'] = [authors_str_match.group(1).strip()]
+                
+        if metadata:
+            return metadata
+            
+    # Raise original exception if all fallbacks fail
+    raise e
 
 def perform_smart_chunking(text, query, chunk_size=3000, overlap=500):
     """
@@ -492,13 +571,7 @@ def generate_citation():
                 raw_content = raw_content.rsplit("```", 1)[0]
         raw_content = raw_content.strip()
 
-        # Robust regex-based extraction of the JSON object
-        match = re.search(r'\{.*\}', raw_content, re.DOTALL)
-        if match:
-            raw_content = match.group(0)
-
-        import json
-        metadata = json.loads(raw_content)
+        metadata = robust_json_loads(raw_content, is_array=False)
 
         title = metadata.get('title', filename.replace('.pdf', '').replace('_', ' '))
         authors_list = metadata.get('authors', [])
@@ -603,6 +676,7 @@ def generate_flashcards():
             "Analyze the following technical paper extract and extract exactly 6 crucial technical terms, concepts, "
             "architectures, or algorithms along with their simple, easy-to-understand definitions (suitable for active recall study).\n"
             "Your response MUST be ONLY a raw JSON array of objects with exactly two keys: 'term' and 'definition'. "
+            "Do not use double quotes inside the term or definition values (if you need quotes, use single quotes like 'self-attention'). "
             "Do not include any chat formatting, markdown blocks, or extra descriptions. "
             "Double-check that the JSON is syntax-correct.\n\n"
             "Example JSON output:\n"
@@ -620,23 +694,7 @@ def generate_flashcards():
         )
 
         raw_content = response.choices[0].message.content.strip()
-        # Clean markdown wrappers if returned
-        if raw_content.startswith("```"):
-            if "json" in raw_content[:15]:
-                raw_content = raw_content.split("json", 1)[1]
-            else:
-                raw_content = raw_content.split("\n", 1)[1]
-            if raw_content.endswith("```"):
-                raw_content = raw_content.rsplit("```", 1)[0]
-        raw_content = raw_content.strip()
-
-        # Robust regex-based extraction of the JSON array
-        match = re.search(r'\[.*\]', raw_content, re.DOTALL)
-        if match:
-            raw_content = match.group(0)
-
-        import json
-        flashcards_list = json.loads(raw_content)
+        flashcards_list = robust_json_loads(raw_content, is_array=True)
 
         return jsonify({
             "success": True,
